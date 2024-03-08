@@ -19,6 +19,7 @@ TARGET_SIZE = tuple(config["folder_processing"]["VIDEO_RESOLUTION"])
 FOLDER_RESIZE = config["folder_processing"]["RESIZE_VIDEOS"]
 TWITCH_OUTPUT_DIR = "vods"
 channel_flags = {}
+channel_output_paths = {}
 channel_flags_lock = threading.Lock()
 STOP_MONITORING = False
 STOP_INFERENCE = False
@@ -32,12 +33,16 @@ channel_names = config["twitch_autodownloader"]["channels"]
 channel_status = {channel: 'offline' for channel in channel_names}
 
 def run_inference(video_file, position=0):
+    global channel_output_paths
     directory = os.path.dirname(video_file)
     try:
         inference.main(video_file, position, input_directory=directory)
     finally:
         base_name = os.path.basename(video_file)
         channel_name = base_name.split('_')[0]
+        with channel_flags_lock:  # Use the lock to ensure thread safety
+            if channel_name in channel_output_paths:
+                del channel_output_paths[channel_name]  # Remove the entry
         set_channel_status(channel_name, "offline")
         position -= 1
         semaphore.release()
@@ -76,7 +81,7 @@ def set_channel_status(channel, status):
     channel_status[channel] = status
 
 def monitor_channels(form):
-    global channel_flags
+    global channel_flags, channel_output_paths
     while not form.stop_thread:
         channel_status = get_twitch_channels_status()
         for channel, status in channel_status.items():
@@ -96,12 +101,12 @@ def monitor_channels(form):
                     twitch_autodownloader.stop_download(channel)  # Stop only the download for this specific channel
 
                     # Explicitly start inference here
-                    output_path = twitch_autodownloader.generate_output_path(channel)  # Assuming this function generates the same path as before
-                    if not STOP_INFERENCE and output_path:  # Check the flag and if output_path is not None
-                        waiting_for_inference.put(output_path)
+                    if not STOP_INFERENCE and channel_output_paths.get(channel):  # Check the flag and if output_path is not None
+                        with channel_flags_lock:
+                            waiting_for_inference.put(channel_output_paths[channel])
                         set_channel_status(channel, "inference")
                         print(f"Explicitly set {channel} status to {channel_status[channel]}.")
-                        print(f"Explicitly added {output_path} to the inference queue.")
+                        print(f"Explicitly added {channel_output_paths[channel]} to the inference queue.")
 
         time.sleep(config["twitch_autodownloader"]["CHECK_INTERVAL"])
         
@@ -110,15 +115,22 @@ def monitor_channels(form):
             break
 
 def start_live_download(channel):
+    global channel_output_paths
     try:
-        output_path = twitch_autodownloader.download_stream(channel)
+        output_path = None
+        try:
+            output_path = twitch_autodownloader.download_stream(channel)
+        except Exception as e:
+            print(f"An error occurred while downloading the stream for {channel}: {e}")
+
         if output_path:
+            with channel_flags_lock:
+                channel_output_paths[channel] = output_path
             if not STOP_INFERENCE:  # Check the flag here
                 # Add the downloaded video to the queue for inference
                 waiting_for_inference.put(output_path)
                 set_channel_status(channel, "inference")
-                print(f"Set {channel} status to {channel_status[channel]}.")
-                print(f"Added {output_path} to the inference queue.")
+                print(f"Set {channel} status to inference and added {output_path} to the inference queue.")
     finally:
         # Update the flag when the download is finished
         channel_flags[channel] = False
